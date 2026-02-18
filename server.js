@@ -30,10 +30,187 @@ const logger = winston.createLogger({
 /* ================= ENV VALIDATION ================= */
 const requiredEnv = [
   "MIDTRANS_SERVER_KEY",
+  "MIDTRANS_CLIENT_KEY",
   "FB_PROJECT_ID",
   "FB_CLIENT_EMAIL",
   "FB_PRIVATE_KEY"
 ];
+
+requiredEnv.forEach((key) => {
+  if (!process.env[key]) {
+    throw new Error(`Missing required env variable: ${key}`);
+  }
+});
+
+/* ================= FIREBASE INIT ================= */
+admin.initializeApp({
+  credential: admin.credential.cert({
+    projectId: process.env.FB_PROJECT_ID,
+    clientEmail: process.env.FB_CLIENT_EMAIL,
+    privateKey: process.env.FB_PRIVATE_KEY.replace(/\\n/g, "\n"),
+  }),
+});
+
+const db = admin.firestore();
+
+/* ================= MIDTRANS INIT ================= */
+const snap = new midtransClient.Snap({
+  isProduction: true,
+  serverKey: process.env.MIDTRANS_SERVER_KEY,
+  clientKey: process.env.MIDTRANS_CLIENT_KEY,
+});
+
+/* ================= ROOT ================= */
+app.get("/", (req, res) => {
+  res.status(200).json({
+    status: "OK",
+    app: "app.rayanxweb.topup",
+    message: "API is running 🚀",
+    timestamp: new Date(),
+  });
+});
+
+/* ================= HEALTH ================= */
+app.get("/health", (req, res) => {
+  res.status(200).send("OK");
+});
+
+/* ================= CREATE TOPUP ================= */
+app.post("/api/topup", async (req, res) => {
+  try {
+    const { uid, amount } = req.body;
+
+    if (!uid || !amount || amount < 10000) {
+      return res.status(400).json({ message: "Invalid request" });
+    }
+
+    const orderId = "TOPUP-" + uuidv4();
+
+    const parameter = {
+      transaction_details: {
+        order_id: orderId,
+        gross_amount: amount,
+      },
+      credit_card: { secure: true },
+    };
+
+    const transaction = await snap.createTransaction(parameter);
+
+    await db.collection("transactions").doc(orderId).set({
+      uid,
+      amount,
+      status: "pending",
+      type: "topup",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    res.json({
+      token: transaction.token,
+      redirect_url: transaction.redirect_url,
+    });
+
+  } catch (error) {
+    logger.error(error);
+    res.status(500).json({ message: "Internal server error" });
+  }
+});
+
+/* ================= MIDTRANS WEBHOOK ================= */
+app.post("/api/midtrans/webhook", async (req, res) => {
+  try {
+    const {
+      order_id,
+      status_code,
+      gross_amount,
+      signature_key,
+      transaction_status
+    } = req.body;
+
+    const serverKey = process.env.MIDTRANS_SERVER_KEY;
+
+    const hash = crypto
+      .createHash("sha512")
+      .update(order_id + status_code + gross_amount + serverKey)
+      .digest("hex");
+
+    if (hash !== signature_key) {
+      return res.status(403).json({ message: "Invalid signature" });
+    }
+
+    if (transaction_status === "settlement" || transaction_status === "capture") {
+      await db.collection("transactions").doc(order_id).update({
+        status: "success",
+        paidAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+
+    if (transaction_status === "expire") {
+      await db.collection("transactions").doc(order_id).update({
+        status: "expired",
+      });
+    }
+
+    res.status(200).json({ message: "Webhook processed" });
+
+  } catch (error) {
+    logger.error(error);
+    res.status(500).json({ message: "Webhook error" });
+  }
+});
+
+/* ================= WITHDRAW REQUEST ================= */
+app.post("/api/withdraw", async (req, res) => {
+  try {
+    const { uid, amount, bankAccount } = req.body;
+
+    if (!uid || !amount || !bankAccount) {
+      return res.status(400).json({ message: "Invalid request" });
+    }
+
+    const withdrawId = "WD-" + uuidv4();
+
+    await db.collection("withdrawals").doc(withdrawId).set({
+      uid,
+      amount,
+      bankAccount,
+      status: "pending",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    res.json({
+      message: "Withdraw request submitted",
+      withdrawId,
+    });
+
+  } catch (error) {
+    logger.error(error);
+    res.status(500).json({ message: "Withdraw error" });
+  }
+});
+
+/* ================= 404 HANDLER ================= */
+app.use((req, res) => {
+  res.status(404).json({
+    status: "error",
+    message: "Route not found"
+  });
+});
+
+/* ================= GLOBAL ERROR HANDLER ================= */
+app.use((err, req, res, next) => {
+  logger.error(err.stack);
+  res.status(500).json({
+    status: "error",
+    message: "Internal Server Error"
+  });
+});
+
+/* ================= START SERVER ================= */
+const PORT = process.env.PORT || 8080;
+
+app.listen(PORT, () => {
+  logger.info(`🚀 Server running on port ${PORT}`);
+});
 
 requiredEnv.forEach(env => {
   if (!process.env[env]) {

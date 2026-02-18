@@ -1,7 +1,20 @@
-FROM node:20-alpine
+# Use Node 18 LTS Alpine
+FROM node:18-alpine
+
+# Create app directory
 WORKDIR /app
+
+# Copy package files
 COPY package*.json ./
-RUN npm install --production
+
+# Install only production dependencies
+RUN npm install --omit=dev
+
+# Copy source
 COPY . .
-EXPOSE 3000
-CMD ["node", "server.js"]
+
+# Expose default Railway port
+EXPOSE 8080
+
+# Start app
+CMD ["npm", "start"]

@@ -2,38 +2,206 @@ require("dotenv").config();
 const express = require("express");
 const helmet = require("helmet");
 const cors = require("cors");
-const admin = require("firebase-admin");
 const midtransClient = require("midtrans-client");
-const rateLimit = require("express-rate-limit");
 const crypto = require("crypto");
 const { v4: uuidv4 } = require("uuid");
-const winston = require("winston");
 
 const app = express();
-
-/* ================= SECURITY ================= */
 app.use(helmet());
 app.use(cors());
 app.use(express.json());
 
-app.use(rateLimit({
-  windowMs: 60 * 1000,
-  max: 100
-}));
+/* ================= CONFIG ================= */
 
-/* ================= LOGGER ================= */
-const logger = winston.createLogger({
-  level: "info",
-  transports: [new winston.transports.Console()]
+const MIN_TOPUP = parseInt(process.env.MIN_TOPUP) || 10000;
+const MAX_WITHDRAW = parseInt(process.env.MAX_WITHDRAW) || 10000000;
+const DAILY_WITHDRAW_LIMIT = parseInt(process.env.DAILY_WITHDRAW_LIMIT) || 20000000;
+
+if (!process.env.MIDTRANS_SERVER_KEY || !process.env.MIDTRANS_CLIENT_KEY) {
+  console.error("Missing Midtrans keys");
+  process.exit(1);
+}
+
+/* ================= MIDTRANS INIT ================= */
+
+const snap = new midtransClient.Snap({
+  isProduction: false, // ubah true jika pakai production key
+  serverKey: process.env.MIDTRANS_SERVER_KEY,
+  clientKey: process.env.MIDTRANS_CLIENT_KEY
 });
 
-/* ================= ENV VALIDATION ================= */
-const requiredEnv = [
-  "MIDTRANS_SERVER_KEY",
-  "MIDTRANS_CLIENT_KEY",
-  "FB_PROJECT_ID",
-  "FB_CLIENT_EMAIL",
-  "FB_PRIVATE_KEY"
+/* ================= IN-MEMORY STORAGE ================= */
+
+const balances = {};
+const pendingOrders = {}; 
+const processedOrders = new Set();
+const withdrawHistory = {};
+
+/* ================= ROOT ================= */
+
+app.get("/", (req, res) => {
+  res.json({
+    status: "OK",
+    mode: "FINTECH VALID VERSION",
+    timestamp: new Date()
+  });
+});
+
+/* ================= CREATE TOPUP ================= */
+
+app.post("/api/topup", async (req, res) => {
+  try {
+    const { userId, amount } = req.body;
+
+    if (!userId || !amount || amount < MIN_TOPUP) {
+      return res.status(400).json({ message: "Invalid request" });
+    }
+
+    const orderId = "TOPUP-" + uuidv4();
+
+    const parameter = {
+      transaction_details: {
+        order_id: orderId,
+        gross_amount: amount
+      }
+    };
+
+    const transaction = await snap.createTransaction(parameter);
+
+    // simpan sementara order
+    pendingOrders[orderId] = {
+      userId,
+      amount
+    };
+
+    res.json({
+      order_id: orderId,
+      token: transaction.token,
+      redirect_url: transaction.redirect_url
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Transaction error" });
+  }
+});
+
+/* ================= WEBHOOK ================= */
+
+app.post("/api/midtrans/webhook", (req, res) => {
+  try {
+    const {
+      order_id,
+      status_code,
+      gross_amount,
+      signature_key,
+      transaction_status
+    } = req.body;
+
+    const expectedSignature = crypto
+      .createHash("sha512")
+      .update(order_id + status_code + gross_amount + process.env.MIDTRANS_SERVER_KEY)
+      .digest("hex");
+
+    if (signature_key !== expectedSignature) {
+      return res.status(403).json({ message: "Invalid signature" });
+    }
+
+    if (processedOrders.has(order_id)) {
+      return res.status(200).json({ message: "Already processed" });
+    }
+
+    if (
+      (transaction_status === "settlement" ||
+        transaction_status === "capture") &&
+      pendingOrders[order_id]
+    ) {
+      const { userId, amount } = pendingOrders[order_id];
+
+      balances[userId] = (balances[userId] || 0) + parseInt(amount);
+
+      processedOrders.add(order_id);
+      delete pendingOrders[order_id];
+
+      console.log("Saldo updated:", userId, balances[userId]);
+    }
+
+    res.status(200).json({ message: "Webhook processed" });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Webhook error" });
+  }
+});
+
+/* ================= CHECK BALANCE ================= */
+
+app.get("/api/balance/:userId", (req, res) => {
+  const { userId } = req.params;
+
+  res.json({
+    userId,
+    balance: balances[userId] || 0
+  });
+});
+
+/* ================= WITHDRAW ================= */
+
+app.post("/api/withdraw", (req, res) => {
+  try {
+    const { userId, amount } = req.body;
+
+    if (!userId || !amount) {
+      return res.status(400).json({ message: "Invalid request" });
+    }
+
+    if (amount > MAX_WITHDRAW) {
+      return res.status(400).json({ message: "Exceeds max withdraw" });
+    }
+
+    if ((balances[userId] || 0) < amount) {
+      return res.status(400).json({ message: "Insufficient balance" });
+    }
+
+    const today = new Date().toISOString().split("T")[0];
+
+    if (!withdrawHistory[userId]) {
+      withdrawHistory[userId] = {};
+    }
+
+    const todayTotal = withdrawHistory[userId][today] || 0;
+
+    if (todayTotal + amount > DAILY_WITHDRAW_LIMIT) {
+      return res.status(400).json({ message: "Daily limit exceeded" });
+    }
+
+    balances[userId] -= amount;
+    withdrawHistory[userId][today] = todayTotal + amount;
+
+    res.json({
+      message: "Withdraw success (simulation)",
+      remaining_balance: balances[userId]
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Withdraw error" });
+  }
+});
+
+/* ================= 404 ================= */
+
+app.use((req, res) => {
+  res.status(404).json({ message: "Route not found" });
+});
+
+/* ================= START ================= */
+
+const PORT = process.env.PORT || 8080;
+
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
 ];
 
 requiredEnv.forEach((key) => {
